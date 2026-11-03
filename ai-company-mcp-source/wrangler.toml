@@ -10,5 +10,5 @@ run_worker_first = ["/api/*", "/mcp"]
 [[d1_databases]]
 binding = "DB"
 database_name = "ai-company-mcp"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "madaod1"
 migrations_dir = "migrations"
