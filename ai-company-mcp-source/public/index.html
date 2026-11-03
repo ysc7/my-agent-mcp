@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Agent 工作台</title>
+  <style>
+    :root{font-family:system-ui,sans-serif;color:#172334;background:#f2f5f9}*{box-sizing:border-box}body{margin:0}header{background:#172b4d;color:white;padding:1.2rem max(1rem,calc((100vw - 1100px)/2))}h1{margin:0;font-size:1.4rem}header p{margin:.4rem 0 0;color:#c6d4e8}main{max-width:1100px;margin:auto;padding:1rem;display:grid;gap:1rem}.grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}section{background:white;border:1px solid #dce4ee;border-radius:.6rem;padding:1rem;min-width:0}h2{font-size:1.1rem;margin:0 0 .8rem}label{display:block;font-weight:600;margin:.6rem 0 .3rem}input,textarea,select,button{font:inherit;border:1px solid #b9c6d6;border-radius:.35rem;padding:.55rem}input,textarea,select{width:100%}textarea{min-height:5rem;resize:vertical}button{background:#2059a8;color:white;border-color:#2059a8;cursor:pointer}button.secondary{background:white;color:#2059a8}button:disabled{opacity:.6;cursor:wait}.row{display:flex;gap:.5rem;align-items:end}.row>div{flex:1}.muted{color:#53657b;font-size:.9rem}ul{list-style:none;margin:.8rem 0;padding:0;max-height:28rem;overflow:auto}li{border-top:1px solid #e4eaf2;padding:.75rem 0;overflow-wrap:anywhere;white-space:pre-wrap}.meta{color:#53657b;font-size:.85rem;margin-bottom:.25rem}.status{min-height:1.4em;overflow-wrap:anywhere}form{margin-top:1rem}button+button{margin-left:.4rem}@media(max-width:700px){.grid{grid-template-columns:1fr}.row{flex-wrap:wrap}}
+  </style>
+</head>
+<body>
+<header><h1>Agent 工作台</h1><p>群消息、私信与任务看板</p></header>
+<main>
+  <section aria-labelledby="access-title"><h2 id="access-title">管理员访问</h2><p class="muted">令牌仅保存在本页面内存中；刷新或关闭页面后清除。请仅在可信设备和安全连接上使用。</p><div class="row"><div><label for="token">管理员令牌</label><input id="token" type="password" autocomplete="off" spellcheck="false"></div><button id="set-token" type="button">使用令牌</button><button id="clear-token" type="button" class="secondary">清除</button></div><p id="status" class="status" role="status" aria-live="polite">请先输入管理员令牌。</p></section>
+  <div class="grid">
+    <section aria-labelledby="messages-title"><h2 id="messages-title">群消息</h2><button type="button" class="secondary" id="refresh-messages">刷新消息</button><ul id="messages" aria-live="polite"></ul><form id="message-form"><label for="message">发送消息</label><textarea id="message" required maxlength="4000"></textarea><button type="submit">发送</button></form></section>
+    <section aria-labelledby="tasks-title"><h2 id="tasks-title">任务看板</h2><button type="button" class="secondary" id="refresh-tasks">刷新任务</button><ul id="tasks" aria-live="polite"></ul><form id="task-form"><label for="task-title">任务标题</label><input id="task-title" required maxlength="200"><label for="task-description">任务描述（可选）</label><textarea id="task-description" maxlength="4000"></textarea><label for="task-assignee">指派给（可选：已配置的 Agent 名称或 admin）</label><input id="task-assignee" maxlength="100" placeholder="留空表示任何 Agent 可领取"><button type="submit">创建任务</button></form></section>
+  </div>
+  <section aria-labelledby="inbox-title"><h2 id="inbox-title">管理员消息收件箱</h2><p class="muted">包含所有群消息和私信，按序号升序每次最多 100 条；重置从头读取，加载下一页获取更多消息。</p><button type="button" class="secondary" id="reset-inbox">从头读取</button><button type="button" class="secondary" id="next-inbox">加载下一页</button><p id="inbox-position" class="muted">尚未读取。</p><ul id="inbox" aria-live="polite"></ul><form id="direct-form"><label for="direct-to">收件 Agent 名称（区分大小写）</label><input id="direct-to" required maxlength="100" autocomplete="off" pattern="[A-Za-z0-9_-]+"><label for="direct-content">私信内容</label><textarea id="direct-content" required maxlength="4000"></textarea><button type="submit">发送私信</button></form></section>
+</main>
+<script>
+'use strict';
+// 所有后端协议差异集中在此处；集成时按实际服务端契约修改。
+const api = {
+  messages: '/api/messages', tasks: '/api/tasks', inbox: '/api/inbox', direct: '/api/direct-messages',
+  headers(token) { return { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }; },
+  messageBody(content) { return { content }; },
+  taskBody(title, description, assignedTo) { return { title, description, ...(assignedTo ? { assigned_to: assignedTo } : {}) }; },
+  messageList(data) { return Array.isArray(data) ? data : data.messages; },
+  taskList(data) { return Array.isArray(data) ? data : data.tasks; }
+};
+let token = '';
+let credentialVersion = 0;
+let inboxCursor = 0;
+let inboxBusy = false;
+const $ = id => document.getElementById(id);
+function status(text) { $('status').textContent = text; }
+async function request(path, options = {}) {
+  if (!token) throw new Error('请先输入管理员令牌。');
+  const version = credentialVersion;
+  let response;
+  try { response = await fetch(path, { method: options.method || 'GET', headers: api.headers(token), body: options.body === undefined ? undefined : JSON.stringify(options.body), cache: 'no-store', credentials: 'omit', redirect: 'error' }); }
+  catch { throw new Error('网络请求失败，操作结果可能未知；请刷新检查后再重试。'); }
+  if (version !== credentialVersion) throw new Error('令牌已更改，之前的请求结果已忽略；写入结果可能未知。');
+  if (!response.ok) {
+    let detail = ''; try { const data = await response.json(); if (typeof data.error === 'string') detail = `：${data.error}`; } catch {}
+    throw new Error(`请求失败（HTTP ${response.status}）${detail}。`);
+  }
+  if (response.status === 204) return null;
+  let data; try { data = await response.json(); } catch { throw new Error('服务端响应不是有效 JSON；写入结果可能未知，请刷新检查。'); }
+  if (version !== credentialVersion) throw new Error('令牌已更改，之前的请求结果已忽略；写入结果可能未知。');
+  return data;
+}
+function addItem(list, metadata, text) {
+  const item = document.createElement('li');
+  const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = metadata;
+  const content = document.createElement('div'); content.textContent = text;
+  item.append(meta, content); list.append(item); return item;
+}
+async function refreshMessages() {
+  const data = await request(api.messages); const entries = api.messageList(data);
+  if (!Array.isArray(entries)) throw new Error('消息响应格式不符合当前适配器。');
+  const list = $('messages'); list.replaceChildren();
+  for (const item of entries) addItem(list, [item.sender || item.role || item.agent || '消息', item.created_at || item.createdAt || ''].filter(Boolean).join(' · '), String(item.content ?? item.text ?? ''));
+}
+function clearDisplayed() {
+  $('messages').replaceChildren(); $('tasks').replaceChildren(); $('inbox').replaceChildren();
+  inboxCursor = 0; $('inbox-position').textContent = '尚未读取。';
+}
+async function loadInbox(reset) {
+  if (inboxBusy) throw new Error('收件箱正在加载，请稍候。');
+  inboxBusy = true; $('reset-inbox').disabled = true; $('next-inbox').disabled = true;
+  try {
+    const since = reset ? 0 : inboxCursor;
+    const data = await request(`${api.inbox}?since=${since}`);
+    if (!data || !Array.isArray(data.messages) || !Number.isSafeInteger(data.next_cursor) || data.next_cursor < since || (data.messages.length === 0 && data.next_cursor !== since) || (data.messages.length > 0 && data.next_cursor <= since)) throw new Error('收件箱响应格式无效。');
+    const fragment = document.createDocumentFragment();
+    for (const item of data.messages) {
+      if (!item || typeof item !== 'object' || !Number.isSafeInteger(item.seq) || item.seq <= since || item.seq > data.next_cursor) throw new Error('收件箱消息格式无效。');
+      addItem(fragment, [`序号 ${item.seq}`, String(item.sender ?? ''), item.recipient == null ? '群消息' : `私信 → ${item.recipient}`, String(item.created_at ?? '')].filter(Boolean).join(' · '), String(item.content ?? ''));
+    }
+    if (reset) $('inbox').replaceChildren();
+    $('inbox').append(fragment); inboxCursor = data.next_cursor;
+    $('inbox-position').textContent = `当前游标：${inboxCursor}；本次读取 ${data.messages.length} 条。`;
+  } finally { inboxBusy = false; $('reset-inbox').disabled = false; $('next-inbox').disabled = false; }
+}
+async function refreshTasks() {
+  const data = await request(api.tasks); const entries = api.taskList(data);
+  if (!Array.isArray(entries)) throw new Error('任务响应格式不符合当前适配器。');
+  const list = $('tasks'); list.replaceChildren();
+  for (const item of entries) {
+    const row = addItem(list, [item.status || '未标记状态', `指派：${item.assigned_to || '任何 Agent'}`, item.claimed_by ? `领取：${item.claimed_by}` : '', item.created_at || item.createdAt || ''].filter(Boolean).join(' · '), [item.title || '', item.description || ''].filter(Boolean).join('\n'));
+    if (item.status === 'claimed') {
+      const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary'; button.textContent = '释放任务';
+      button.addEventListener('click', () => {
+        if (!confirm('确认释放此任务？任务将返回待领取状态，指派人员保持不变。')) return;
+        button.disabled = true;
+        run(async () => {
+          try { await request(`${api.tasks}/${encodeURIComponent(item.id)}/release`, { method: 'POST', body: {} }); }
+          catch (error) { try { await refreshTasks(); } catch {} throw error; }
+          try { await refreshTasks(); } catch { throw new Error('任务已释放，但刷新失败；请手动刷新。'); }
+        }, '任务已释放。').finally(() => { button.disabled = false; });
+      });
+      row.append(button);
+    }
+  }
+}
+async function run(action, success) { try { await action(); status(success); } catch (error) { status(error instanceof Error ? error.message : '操作失败。'); } }
+$('set-token').addEventListener('click', () => { token = $('token').value.trim(); credentialVersion++; $('token').value = ''; clearDisplayed(); status(token ? '令牌已保存在内存中。' : '请输入管理员令牌。'); });
+$('clear-token').addEventListener('click', () => { token = ''; credentialVersion++; $('token').value = ''; clearDisplayed(); status('令牌和已显示的数据已清除。'); });
+$('reset-inbox').addEventListener('click', () => run(() => loadInbox(true), '收件箱已从头读取。'));
+$('next-inbox').addEventListener('click', () => run(() => loadInbox(false), '收件箱已加载。'));
+$('direct-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const to = $('direct-to').value.trim(), content = $('direct-content').value.trim();
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(to)) { status('请输入有效的 Agent 名称（1–100 位字母、数字、下划线或连字符）。'); return; }
+  if (!content || content.length > 4000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(content)) { status('请输入有效的私信内容（1–4000 字符，不含非法控制字符）。'); return; }
+  const button = event.currentTarget.querySelector('button[type="submit"]'); button.disabled = true;
+  run(async () => { await request(api.direct, { method: 'POST', body: { to, content } }); $('direct-content').value = ''; }, '私信已发送。可加载收件箱查看。').finally(() => { button.disabled = false; });
+});
+$('refresh-messages').addEventListener('click', () => run(refreshMessages, '消息已刷新。'));
+$('refresh-tasks').addEventListener('click', () => run(refreshTasks, '任务已刷新。'));
+$('message-form').addEventListener('submit', event => { event.preventDefault(); const value = $('message').value.trim(); if (!value) return; run(async () => { await request(api.messages, { method: 'POST', body: api.messageBody(value) }); $('message').value = ''; try { await refreshMessages(); } catch { throw new Error('消息已发送，但刷新失败；请手动刷新，避免重复发送。'); } }, '消息已发送。'); });
+$('task-form').addEventListener('submit', event => { event.preventDefault(); const title = $('task-title').value.trim(); if (!title) return; const description = $('task-description').value.trim(); run(async () => { await request(api.tasks, { method: 'POST', body: api.taskBody(title, description, $('task-assignee').value.trim()) }); $('task-title').value = ''; $('task-description').value = ''; $('task-assignee').value = ''; try { await refreshTasks(); } catch { throw new Error('任务已创建，但刷新失败；请手动刷新，避免重复创建。'); } }, '任务已创建。'); });
+</script>
+</body>
+</html>
